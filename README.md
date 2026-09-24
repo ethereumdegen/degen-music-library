@@ -50,6 +50,14 @@ Actual decoding support depends on the codec data inside the file and Rodio/Symp
 
 ## Install
 
+### Omarchy / Arch Linux
+
+```bash
+omarchy pkg aur add degen-music-library
+```
+
+This installs a pacman-managed package from the Arch User Repository.
+
 ### Install directly from GitHub
 
 ```bash
