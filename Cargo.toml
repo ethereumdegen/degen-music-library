@@ -15,6 +15,7 @@ aws-sdk-s3 = "1"
 crossterm = "0.29"
 ratatui = { version = "0.30", features = ["crossterm"], default-features = false }
 rodio = { version = "0.22", features = ["playback", "symphonia-all"], default-features = false }
+rustfft = "6"
 tempfile = "3"
 tokio = { version = "1.52", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 url = "2.5"

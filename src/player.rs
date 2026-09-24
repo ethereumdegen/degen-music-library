@@ -1,4 +1,5 @@
 use crate::storage::DownloadedTrack;
+use crate::visualizer::{AnalyzedSource, SampleTap, SpectrumAnalyzer, BAR_COUNT};
 use anyhow::{Context, Result};
 use rodio::cpal::traits::HostTrait;
 use rodio::{Decoder, DeviceSinkBuilder, Player, Source};
@@ -8,15 +9,25 @@ use std::time::Duration;
 
 const DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub struct CachedTrack {
+  file: tempfile::NamedTempFile,
+  byte_len: u64,
+  content_type: Option<String>,
+  extension: Option<String>,
+}
+
 pub struct PreparedTrack {
   source: Box<dyn Source + Send>,
   pub duration: Option<Duration>,
+  pub cache: Arc<CachedTrack>,
 }
 
 pub struct AudioPlayer {
   player: Arc<Player>,
   _keepalive: mpsc::Sender<()>,
   volume: u8,
+  tap: SampleTap,
+  analyzer: SpectrumAnalyzer,
 }
 
 impl AudioPlayer {
@@ -56,16 +67,23 @@ impl AudioPlayer {
       .map_err(anyhow::Error::msg)?;
     player.pause();
     player.set_volume(volume_gain(volume));
+    let tap = SampleTap::default();
+    let analyzer = SpectrumAnalyzer::new(tap.clone());
     Ok(Self {
       player: Arc::new(player),
       _keepalive: keepalive_tx,
       volume,
+      tap,
+      analyzer,
     })
   }
 
   pub fn play(&self, prepared: PreparedTrack) {
+    self.tap.clear();
     self.player.clear();
-    self.player.append(prepared.source);
+    self
+      .player
+      .append(AnalyzedSource::new(prepared.source, self.tap.clone()));
     self.player.play();
   }
 
@@ -81,6 +99,7 @@ impl AudioPlayer {
 
   pub fn stop(&self) {
     self.player.clear();
+    self.tap.clear();
   }
 
   pub fn set_volume(&mut self, volume: u8) {
@@ -95,21 +114,39 @@ impl AudioPlayer {
   pub fn is_finished(&self) -> bool {
     self.player.empty()
   }
+
+  pub fn spectrum(&mut self) -> [f32; BAR_COUNT] {
+    self.analyzer.update()
+  }
+}
+
+pub fn cache_download(downloaded: DownloadedTrack) -> Arc<CachedTrack> {
+  Arc::new(CachedTrack {
+    file: downloaded.file,
+    byte_len: downloaded.byte_len,
+    content_type: downloaded.content_type,
+    extension: downloaded.extension,
+  })
 }
 
 pub fn prepare(downloaded: DownloadedTrack) -> Result<PreparedTrack> {
-  if downloaded.byte_len == 0 {
+  prepare_cached(cache_download(downloaded))
+}
+
+pub fn prepare_cached(cache: Arc<CachedTrack>) -> Result<PreparedTrack> {
+  if cache.byte_len == 0 {
     anyhow::bail!("audio object is empty");
   }
-  let reader = BufReader::new(downloaded.file);
+  let file = cache.file.reopen().context("reopening cached audio file")?;
+  let reader = BufReader::new(file);
   let mut builder = Decoder::builder()
     .with_data(reader)
-    .with_byte_len(downloaded.byte_len)
+    .with_byte_len(cache.byte_len)
     .with_seekable(true);
-  if let Some(extension) = downloaded.extension.as_deref() {
+  if let Some(extension) = cache.extension.as_deref() {
     builder = builder.with_hint(extension);
   }
-  if let Some(content_type) = downloaded.content_type.as_deref() {
+  if let Some(content_type) = cache.content_type.as_deref() {
     builder = builder.with_mime_type(content_type);
   }
   let decoder = builder
@@ -119,6 +156,7 @@ pub fn prepare(downloaded: DownloadedTrack) -> Result<PreparedTrack> {
   Ok(PreparedTrack {
     source: Box::new(decoder),
     duration,
+    cache,
   })
 }
 

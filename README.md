@@ -30,6 +30,9 @@ Degen Music Library turns an object-storage bucket into a browsable music librar
 - Play audio through the system's default output device.
 - Automatic playback of the next track in the current folder.
 - Pause, resume, stop, next, previous, and volume controls.
+- Repeat the current track once or continuously without downloading it again.
+- Toggle between the library and a real-time, 64-band FFT visualizer.
+- Rapid `n`/`p` navigation uses cancellable, latest-request-wins loading.
 - Track progress, duration, file size, and playback-state display.
 - Paginated bucket listings for libraries with more than 1,000 objects.
 - Case-insensitive audio extension detection.
@@ -149,6 +152,8 @@ Degen Music Library uses path-style bucket addressing for compatibility with cus
 | `Backspace` / `Left` / `h` | Go to the parent folder |
 | `Space` | Pause or resume |
 | `n` / `p` | Next or previous track |
+| `o` | Cycle loop mode: Off → Once → Forever |
+| `v` | Toggle between the library and FFT visualizer |
 | `+` / `-` | Increase or decrease volume |
 | `x` | Stop playback |
 | `r` | Reload the current folder |
@@ -157,14 +162,18 @@ Degen Music Library uses path-style bucket addressing for compatibility with cus
 
 `Ctrl+C` exits from either screen.
 
+**Loop Once** replays the current track one additional time, then returns to normal playback and advances. **Loop Forever** replays the current track until you change the mode, select another track, or stop playback.
+
+Rapid navigation never queues tracks. Each `n` or `p` press stops current playback, moves from the latest pending selection, aborts the obsolete request, and starts only the final requested track. The app does not speculatively prefetch neighboring objects.
+
 ## Security and privacy
 
 - Credentials are entered interactively and are never written to disk.
 - The secret access key is masked in the terminal.
 - Access-key and secret-key form buffers are zeroed after a successful connection.
 - Credentials remain in the in-memory AWS SDK client only for the active session.
-- Audio objects are downloaded to unnamed temporary files rather than retained in the music directory.
-- Temporary audio files are removed by the operating system when their handles close.
+- Audio objects are downloaded to managed temporary files rather than retained in the music directory.
+- Temporary audio files are removed when the cached track is dropped or the application exits.
 - The application contains no telemetry or analytics integration.
 
 For Cloudflare R2, prefer a bucket-scoped, read-only API token. Do not reuse an account-wide administrative token.
@@ -173,10 +182,11 @@ For Cloudflare R2, prefer a bucket-scoped, read-only API token. Do not reuse an 
 
 1. The app requests the current prefix with S3 `ListObjectsV2` and `/` as the delimiter.
 2. Common prefixes become folders; supported audio objects become tracks.
-3. Selecting a track downloads it asynchronously into an unnamed temporary file.
+3. Selecting a track downloads it asynchronously into a managed temporary file.
 4. Rodio and Symphonia detect and decode the audio format.
-5. Playback begins through the default output device.
-6. When the track finishes, the next audio object in that folder starts automatically.
+5. A lightweight sample tap feeds a Hann-windowed, 2,048-point FFT for the visualizer.
+6. Playback begins through the default output device.
+7. At track end, the selected loop mode reopens the cached file or normal playback advances.
 
 The complete object is downloaded before playback begins. This keeps memory usage bounded and decoding reliable, but very large tracks or slow connections can take a moment to start.
 
@@ -214,6 +224,7 @@ src/
 ├── app.rs      application state, input handling, and async task coordination
 ├── player.rs   audio device, decoder, and playback controls
 ├── storage.rs  S3 connection, listing, filtering, and downloads
+├── visualizer.rs audio sample capture and FFT spectrum analysis
 ├── ui.rs       Ratatui rendering
 └── main.rs     executable entry point
 ```

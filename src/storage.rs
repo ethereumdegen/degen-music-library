@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::Client;
-use std::io::{Seek, SeekFrom};
 use tokio::io::AsyncWriteExt;
 use url::Url;
 
@@ -34,7 +33,7 @@ pub struct Entry {
 }
 
 pub struct DownloadedTrack {
-  pub file: std::fs::File,
+  pub file: tempfile::NamedTempFile,
   pub byte_len: u64,
   pub content_type: Option<String>,
   pub extension: Option<String>,
@@ -173,7 +172,10 @@ impl Storage {
       .rsplit_once('.')
       .map(|(_, extension)| extension.to_ascii_lowercase());
     let mut body = output.body;
-    let file = tempfile::tempfile().context("creating temporary audio file")?;
+    let temporary = tempfile::NamedTempFile::new().context("creating temporary audio file")?;
+    let file = temporary
+      .reopen()
+      .context("opening temporary audio file for download")?;
     let mut file = tokio::fs::File::from_std(file);
     let mut byte_len = 0_u64;
 
@@ -192,12 +194,9 @@ impl Storage {
       .await
       .context("flushing temporary audio file")?;
 
-    let mut file = file.into_std().await;
-    file
-      .seek(SeekFrom::Start(0))
-      .context("rewinding temporary audio file")?;
+    drop(file.into_std().await);
     Ok(DownloadedTrack {
-      file,
+      file: temporary,
       byte_len,
       content_type,
       extension,

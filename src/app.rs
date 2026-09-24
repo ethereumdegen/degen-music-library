@@ -1,4 +1,4 @@
-use crate::player::{self, AudioPlayer, PreparedTrack};
+use crate::player::{self, AudioPlayer, CachedTrack, PreparedTrack};
 use crate::storage::{ConnectionDetails, Entry, EntryKind, Storage};
 use crate::ui;
 use anyhow::{Context, Result};
@@ -16,12 +16,56 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use zeroize::Zeroize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
   Credentials,
   Browser,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepeatMode {
+  #[default]
+  Off,
+  Once,
+  Forever,
+}
+
+impl RepeatMode {
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::Off => "Off",
+      Self::Once => "Once",
+      Self::Forever => "Forever",
+    }
+  }
+
+  fn cycle(self) -> Self {
+    match self {
+      Self::Off => Self::Once,
+      Self::Once => Self::Forever,
+      Self::Forever => Self::Off,
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionAction {
+  Advance,
+  Replay,
+}
+
+fn completion_action(mode: &mut RepeatMode) -> CompletionAction {
+  match mode {
+    RepeatMode::Off => CompletionAction::Advance,
+    RepeatMode::Once => {
+      *mode = RepeatMode::Off;
+      CompletionAction::Replay
+    }
+    RepeatMode::Forever => CompletionAction::Replay,
+  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +160,7 @@ pub struct CurrentTrack {
   pub key: String,
   pub name: String,
   pub duration: Option<Duration>,
+  cache: Arc<CachedTrack>,
 }
 
 pub struct App {
@@ -131,10 +176,15 @@ pub struct App {
   pub completed: bool,
   pub now_playing: Option<CurrentTrack>,
   pub animation_frame: usize,
+  pub repeat_mode: RepeatMode,
+  pub show_visualizer: bool,
+  pub spectrum: [f32; crate::visualizer::BAR_COUNT],
   storage: Option<Storage>,
   player: Option<AudioPlayer>,
   generation: u64,
   finished_handled: bool,
+  track_task: Option<JoinHandle<()>>,
+  pending_track: Option<usize>,
 }
 
 impl Default for App {
@@ -153,10 +203,15 @@ impl Default for App {
       completed: false,
       now_playing: None,
       animation_frame: 0,
+      repeat_mode: RepeatMode::Off,
+      show_visualizer: false,
+      spectrum: [0.0; crate::visualizer::BAR_COUNT],
       storage: None,
       player: None,
       generation: 0,
       finished_handled: true,
+      track_task: None,
+      pending_track: None,
     }
   }
 }
@@ -224,9 +279,6 @@ impl App {
   }
 
   fn begin_play(&mut self, index: usize, tx: &mpsc::UnboundedSender<AppEvent>) {
-    if self.busy {
-      return;
-    }
     let Some(entry) = self.entries.get(index).cloned() else {
       return;
     };
@@ -237,11 +289,25 @@ impl App {
       return;
     };
 
+    if let Some(task) = self.track_task.take() {
+      task.abort();
+    }
+    if let Some(player) = self.player.as_ref() {
+      player.stop();
+    }
+    self.now_playing = None;
+    self.paused = false;
+    self.completed = false;
+    self.finished_handled = true;
+    self.spectrum = [0.0; crate::visualizer::BAR_COUNT];
+    self.selected = index;
+    self.pending_track = Some(index);
+
     let generation = self.next_generation();
     self.busy = true;
-    self.status = format!("Downloading {}...", entry.name);
+    self.status = format!("Loading {}...", entry.name);
     let tx = tx.clone();
-    tokio::spawn(async move {
+    self.track_task = Some(tokio::spawn(async move {
       let result = async {
         let downloaded = storage.download(&entry.key).await?;
         tokio::task::spawn_blocking(move || player::prepare(downloaded))
@@ -257,7 +323,46 @@ impl App {
         name: entry.name,
         result,
       });
-    });
+    }));
+  }
+
+  fn begin_replay(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    if self.busy {
+      return;
+    }
+    let Some(track) = self.now_playing.as_ref() else {
+      return;
+    };
+    let cache = Arc::clone(&track.cache);
+    let key = track.key.clone();
+    let name = track.name.clone();
+    let index = self
+      .entries
+      .iter()
+      .position(|entry| entry.key == key)
+      .unwrap_or(self.selected);
+    if let Some(task) = self.track_task.take() {
+      task.abort();
+    }
+    let generation = self.next_generation();
+    self.busy = true;
+    self.pending_track = Some(index);
+    self.status = format!("Looping {name}...");
+    let tx = tx.clone();
+    self.track_task = Some(tokio::spawn(async move {
+      let result = tokio::task::spawn_blocking(move || player::prepare_cached(cache))
+        .await
+        .context("audio decoder task failed")
+        .and_then(|result| result)
+        .map_err(|error| format!("Could not replay {name}: {error:#}"));
+      let _ = tx.send(AppEvent::TrackReady {
+        generation,
+        index,
+        key,
+        name,
+        result,
+      });
+    }));
   }
 
   fn activate_selected(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
@@ -296,6 +401,24 @@ impl App {
     self.status = format!("Volume {}%", self.volume);
   }
 
+  fn cycle_repeat_mode(&mut self) {
+    self.repeat_mode = self.repeat_mode.cycle();
+    self.status = match self.repeat_mode {
+      RepeatMode::Off => "Loop mode: off.".to_owned(),
+      RepeatMode::Once => "Loop mode: replay the current track once.".to_owned(),
+      RepeatMode::Forever => "Loop mode: replay the current track forever.".to_owned(),
+    };
+  }
+
+  fn toggle_visualizer(&mut self) {
+    self.show_visualizer = !self.show_visualizer;
+    self.status = if self.show_visualizer {
+      "FFT visualizer enabled. Press V to return to the library.".to_owned()
+    } else {
+      "Library view enabled. Press V for the FFT visualizer.".to_owned()
+    };
+  }
+
   fn toggle_pause(&mut self) {
     let Some(player) = self.player.as_ref() else {
       return;
@@ -308,6 +431,12 @@ impl App {
   }
 
   fn stop(&mut self) {
+    if let Some(task) = self.track_task.take() {
+      task.abort();
+      self.next_generation();
+    }
+    self.pending_track = None;
+    self.busy = false;
     if let Some(player) = self.player.as_ref() {
       player.stop();
     }
@@ -315,15 +444,18 @@ impl App {
     self.paused = false;
     self.completed = false;
     self.finished_handled = true;
+    self.spectrum = [0.0; crate::visualizer::BAR_COUNT];
     self.status = "Stopped".to_owned();
   }
 
   fn adjacent_track(&self, forward: bool) -> Option<usize> {
-    let current = self
-      .now_playing
-      .as_ref()
-      .and_then(|track| self.entries.iter().position(|entry| entry.key == track.key))
-      .unwrap_or(self.selected);
+    let current = self.pending_track.unwrap_or_else(|| {
+      self
+        .now_playing
+        .as_ref()
+        .and_then(|track| self.entries.iter().position(|entry| entry.key == track.key))
+        .unwrap_or(self.selected)
+    });
     if forward {
       self
         .entries
@@ -363,6 +495,7 @@ impl App {
     self.prefix.clear();
     self.selected = 0;
     self.screen = Screen::Credentials;
+    self.show_visualizer = false;
     self.status = "Enter credentials for an S3-compatible bucket.".to_owned();
   }
 
@@ -420,6 +553,8 @@ impl App {
       KeyCode::Char('n') => self.play_adjacent(true, tx),
       KeyCode::Char('p') => self.play_adjacent(false, tx),
       KeyCode::Char('x') => self.stop(),
+      KeyCode::Char('o') | KeyCode::Char('O') => self.cycle_repeat_mode(),
+      KeyCode::Char('v') | KeyCode::Char('V') => self.toggle_visualizer(),
       KeyCode::Char('r') => self.begin_list(self.prefix.clone(), tx),
       KeyCode::Char('c') => self.open_credentials(),
       _ => {}
@@ -480,10 +615,13 @@ impl App {
         name,
         result,
       } if generation == self.generation => {
+        self.track_task = None;
+        self.pending_track = None;
         self.busy = false;
         match result {
           Ok(prepared) => {
             let duration = prepared.duration;
+            let cache = Arc::clone(&prepared.cache);
             let player = match self.player.as_mut() {
               Some(player) => player,
               None => match AudioPlayer::new(self.volume) {
@@ -500,6 +638,7 @@ impl App {
               key,
               name: name.clone(),
               duration,
+              cache,
             });
             self.paused = false;
             self.completed = false;
@@ -521,6 +660,13 @@ impl App {
     if self.now_playing.is_some() && !self.paused && !self.completed {
       self.animation_frame = (self.animation_frame + 1) % 5;
     }
+    if self.show_visualizer {
+      self.spectrum = self
+        .player
+        .as_mut()
+        .map_or([0.0; crate::visualizer::BAR_COUNT], AudioPlayer::spectrum);
+    }
+
     let finished = self.player.as_ref().is_some_and(AudioPlayer::is_finished);
     if self.now_playing.is_some()
       && !self.paused
@@ -530,11 +676,16 @@ impl App {
     {
       self.finished_handled = true;
       self.completed = true;
-      if let Some(index) = self.adjacent_track(true) {
-        self.selected = index;
-        self.begin_play(index, tx);
-      } else {
-        self.status = "Finished the last track in this folder.".to_owned();
+      match completion_action(&mut self.repeat_mode) {
+        CompletionAction::Replay => self.begin_replay(tx),
+        CompletionAction::Advance => {
+          if let Some(index) = self.adjacent_track(true) {
+            self.selected = index;
+            self.begin_play(index, tx);
+          } else {
+            self.status = "Finished the last track in this folder.".to_owned();
+          }
+        }
       }
     }
   }
@@ -652,5 +803,58 @@ mod tests {
     assert_eq!(parent_prefix("Artists/Album/"), "Artists/");
     assert_eq!(parent_prefix("Artists/"), "");
     assert_eq!(parent_prefix(""), "");
+  }
+
+  #[test]
+  fn loop_once_replays_then_returns_to_normal_advancement() {
+    let mut mode = RepeatMode::Once;
+    assert_eq!(completion_action(&mut mode), CompletionAction::Replay);
+    assert_eq!(mode, RepeatMode::Off);
+    assert_eq!(completion_action(&mut mode), CompletionAction::Advance);
+  }
+
+  #[test]
+  fn loop_forever_keeps_replaying() {
+    let mut mode = RepeatMode::Forever;
+    assert_eq!(completion_action(&mut mode), CompletionAction::Replay);
+    assert_eq!(mode, RepeatMode::Forever);
+    assert_eq!(completion_action(&mut mode), CompletionAction::Replay);
+  }
+
+  #[test]
+  fn rapid_navigation_advances_from_the_pending_target() {
+    let app = App {
+      entries: vec![
+        Entry {
+          kind: EntryKind::Track,
+          key: "one.mp3".to_owned(),
+          name: "one.mp3".to_owned(),
+          size: 1,
+        },
+        Entry {
+          kind: EntryKind::Folder,
+          key: "folder/".to_owned(),
+          name: "folder".to_owned(),
+          size: 0,
+        },
+        Entry {
+          kind: EntryKind::Track,
+          key: "two.mp3".to_owned(),
+          name: "two.mp3".to_owned(),
+          size: 1,
+        },
+        Entry {
+          kind: EntryKind::Track,
+          key: "three.mp3".to_owned(),
+          name: "three.mp3".to_owned(),
+          size: 1,
+        },
+      ],
+      pending_track: Some(2),
+      ..App::default()
+    };
+
+    assert_eq!(app.adjacent_track(true), Some(3));
+    assert_eq!(app.adjacent_track(false), Some(0));
   }
 }

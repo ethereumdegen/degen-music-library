@@ -3,7 +3,9 @@ use crate::storage::EntryKind;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+  Bar, BarChart, Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 const ACCENT: Color = Color::Rgb(122, 162, 247);
 const SECONDARY: Color = Color::Rgb(187, 154, 247);
@@ -141,6 +143,34 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &App) {
     rows[0],
   );
 
+  if app.show_visualizer {
+    draw_visualizer(frame, rows[1], app);
+  } else {
+    draw_library(frame, rows[1], app);
+  }
+
+  draw_now_playing(frame, rows[2], app);
+
+  let status_style = if app.status.starts_with("Could not") || app.status.starts_with("Connection")
+  {
+    Style::default().fg(ERROR)
+  } else {
+    Style::default().fg(Color::White)
+  };
+  frame.render_widget(
+    Paragraph::new(Line::from(vec![
+      Span::styled(format!(" {} ", app.status), status_style),
+      Span::styled(
+        " | Space pause | N/P track | O loop | V view | +/- volume | Q quit ",
+        Style::default().fg(MUTED),
+      ),
+    ]))
+    .block(Block::default().borders(Borders::ALL).title("Controls")),
+    rows[3],
+  );
+}
+
+fn draw_library(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
   let items = app
     .entries
     .iter()
@@ -169,13 +199,13 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &App) {
     })
     .collect::<Vec<_>>();
 
-  let list_title = if app.busy {
+  let title = if app.busy {
     "Bucket Browser - loading..."
   } else {
-    "Bucket Browser - Enter: open/play  Backspace: parent"
+    "Bucket Browser - Enter: open/play  Backspace: parent  V: visualizer"
   };
   let list = List::new(items)
-    .block(Block::default().borders(Borders::ALL).title(list_title))
+    .block(Block::default().borders(Borders::ALL).title(title))
     .highlight_symbol("-> ")
     .highlight_style(
       Style::default()
@@ -185,26 +215,55 @@ fn draw_browser(frame: &mut ratatui::Frame<'_>, app: &App) {
     );
   let mut list_state =
     ListState::default().with_selected((!app.entries.is_empty()).then_some(app.selected));
-  frame.render_stateful_widget(list, rows[1], &mut list_state);
+  frame.render_stateful_widget(list, area, &mut list_state);
+}
 
-  draw_now_playing(frame, rows[2], app);
+fn draw_visualizer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+  let block = Block::default()
+    .borders(Borders::ALL)
+    .border_style(Style::default().fg(SECONDARY))
+    .title("FFT Visualizer - low 40 Hz  |  high 16 kHz  |  V: library");
+  if app.now_playing.is_none() {
+    frame.render_widget(
+      Paragraph::new("Play a track to start the FFT visualizer.")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(MUTED))
+        .block(block),
+      area,
+    );
+    return;
+  }
 
-  let status_style = if app.status.starts_with("Could not") || app.status.starts_with("Connection")
-  {
-    Style::default().fg(ERROR)
-  } else {
-    Style::default().fg(Color::White)
-  };
+  let available = usize::from(area.width.saturating_sub(2)).max(1);
+  let count = available.min(crate::visualizer::BAR_COUNT);
+  let bars = (0..count)
+    .map(|index| {
+      let start = index * crate::visualizer::BAR_COUNT / count;
+      let end = ((index + 1) * crate::visualizer::BAR_COUNT / count).max(start + 1);
+      let level = app.spectrum[start..end]
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max);
+      let color = if index * 3 < count {
+        SECONDARY
+      } else if index * 3 < count * 2 {
+        ACCENT
+      } else {
+        SUCCESS
+      };
+      Bar::default()
+        .value((level * 100.0).round() as u64)
+        .text_value("")
+        .style(Style::default().fg(color))
+    })
+    .collect::<Vec<_>>();
   frame.render_widget(
-    Paragraph::new(Line::from(vec![
-      Span::styled(format!(" {} ", app.status), status_style),
-      Span::styled(
-        " | Space pause | N/P next/previous | +/- volume | X stop | R reload | C connect | Q quit ",
-        Style::default().fg(MUTED),
-      ),
-    ]))
-    .block(Block::default().borders(Borders::ALL).title("Controls")),
-    rows[3],
+    BarChart::new(bars)
+      .block(block)
+      .bar_width(1)
+      .bar_gap(0)
+      .max(100),
+    area,
   );
 }
 
@@ -214,7 +273,7 @@ fn draw_now_playing(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
   frame.render_widget(outer, area);
   let columns = Layout::default()
     .direction(Direction::Horizontal)
-    .constraints([Constraint::Min(20), Constraint::Length(13)])
+    .constraints([Constraint::Min(20), Constraint::Length(16)])
     .split(inner);
 
   if let Some(track) = app.now_playing.as_ref() {
@@ -252,9 +311,13 @@ fn draw_now_playing(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
       EQUALIZER[app.animation_frame]
     };
     frame.render_widget(
-      Paragraph::new(format!("{activity}\nVol {}%", app.volume))
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(SUCCESS)),
+      Paragraph::new(format!(
+        "{activity}\nLoop {}\nVol {}%",
+        app.repeat_mode.label(),
+        app.volume
+      ))
+      .alignment(Alignment::Right)
+      .style(Style::default().fg(SUCCESS)),
       columns[1],
     );
   } else {
