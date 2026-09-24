@@ -1,0 +1,27 @@
+[package]
+name = "degen-music-library"
+description = "A terminal music player for S3-compatible object storage"
+version = "0.1.0"
+authors = ["ethereumdegen"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ethereumdegen/degen-music-library"
+keywords = ["audio", "s3", "tui", "terminal"]
+categories = ["command-line-utilities", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0"
+aws-sdk-s3 = "1"
+crossterm = "0.29"
+ratatui = { version = "0.30", features = ["crossterm"], default-features = false }
+rodio = { version = "0.22", features = ["playback", "symphonia-all"], default-features = false }
+tempfile = "3"
+tokio = { version = "1.52", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+url = "2.5"
+zeroize = "1.8"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
