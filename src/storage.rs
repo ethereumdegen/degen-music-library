@@ -1,21 +1,30 @@
 use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::Client;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use url::Url;
+use zeroize::Zeroize;
 
 const AUDIO_EXTENSIONS: &[&str] = &[
   "aac", "aif", "aiff", "alac", "flac", "m4a", "mka", "mp2", "mp3", "ogg", "oga", "opus", "wav",
   "wave", "webm",
 ];
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ConnectionDetails {
   pub endpoint: String,
   pub region: String,
   pub bucket: String,
   pub access_key: String,
   pub secret_key: String,
+}
+
+impl Drop for ConnectionDetails {
+  fn drop(&mut self) {
+    self.access_key.zeroize();
+    self.secret_key.zeroize();
+  }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,7 +55,7 @@ pub struct Storage {
 }
 
 impl Storage {
-  pub fn connect(details: ConnectionDetails) -> Result<Self> {
+  pub fn connect(details: &ConnectionDetails) -> Result<Self> {
     let endpoint = normalize_endpoint(&details.endpoint)?;
     let region = details.region.trim();
     let bucket = details.bucket.trim();
@@ -64,7 +73,7 @@ impl Storage {
 
     let credentials = Credentials::new(
       access_key,
-      details.secret_key,
+      details.secret_key.clone(),
       None,
       None,
       "degen-music-library",

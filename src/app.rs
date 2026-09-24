@@ -1,3 +1,4 @@
+use crate::credential_store;
 use crate::player::{self, AudioPlayer, CachedTrack, PreparedTrack};
 use crate::storage::{ConnectionDetails, Entry, EntryKind, Storage};
 use crate::ui;
@@ -154,6 +155,19 @@ impl CredentialForm {
     self.access_key.zeroize();
     self.secret_key.zeroize();
   }
+
+  fn apply(&mut self, details: &ConnectionDetails) {
+    self.endpoint.clone_from(&details.endpoint);
+    self.region.clone_from(&details.region);
+    self.bucket.clone_from(&details.bucket);
+    self.access_key.clone_from(&details.access_key);
+    self.secret_key.clone_from(&details.secret_key);
+  }
+
+  fn clear(&mut self) {
+    self.clear_sensitive();
+    *self = Self::default();
+  }
 }
 
 pub struct CurrentTrack {
@@ -195,8 +209,7 @@ impl Default for App {
       entries: Vec::new(),
       selected: 0,
       prefix: String::new(),
-      status: "Enter your S3-compatible bucket credentials. They are kept in memory only."
-        .to_owned(),
+      status: "Loading saved credentials from the OS keyring...".to_owned(),
       busy: false,
       volume: 80,
       paused: false,
@@ -233,24 +246,67 @@ impl App {
     self.generation
   }
 
+  fn begin_load_saved_credentials(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    self.busy = true;
+    self.status = "Loading saved credentials from the OS keyring...".to_owned();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+      let result = tokio::task::spawn_blocking(credential_store::load)
+        .await
+        .context("credential loader task failed")
+        .and_then(|result| result)
+        .map_err(|error| format!("Could not load saved credentials: {error:#}"));
+      let _ = tx.send(AppEvent::SavedCredentials(result));
+    });
+  }
+
   fn begin_connect(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
     if self.busy {
       return;
     }
-    let details = self.credentials.details();
+    self.begin_connect_with(self.credentials.details(), tx);
+  }
+
+  fn begin_connect_with(
+    &mut self,
+    details: ConnectionDetails,
+    tx: &mpsc::UnboundedSender<AppEvent>,
+  ) {
     let generation = self.next_generation();
     self.busy = true;
     self.status = "Connecting and reading the bucket root...".to_owned();
     let tx = tx.clone();
     tokio::spawn(async move {
       let result = async {
-        let storage = Storage::connect(details)?;
+        let storage = Storage::connect(&details)?;
         let entries = storage.list("").await?;
-        Ok::<_, anyhow::Error>((storage, entries))
+        let save_error =
+          match tokio::task::spawn_blocking(move || credential_store::save(&details)).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("Credentials were not saved: {error:#}")),
+            Err(error) => Some(format!(
+              "Credentials were not saved: saver task failed: {error}"
+            )),
+          };
+        Ok::<_, anyhow::Error>((storage, entries, save_error))
       }
       .await
       .map_err(|error| format!("Connection failed: {error:#}"));
       let _ = tx.send(AppEvent::Connected { generation, result });
+    });
+  }
+
+  fn begin_forget_credentials(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) {
+    self.busy = true;
+    self.status = "Removing saved credentials from the OS keyring...".to_owned();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+      let result = tokio::task::spawn_blocking(credential_store::forget)
+        .await
+        .context("credential deletion task failed")
+        .and_then(|result| result)
+        .map_err(|error| format!("Could not forget saved credentials: {error:#}"));
+      let _ = tx.send(AppEvent::ForgotCredentials(result));
     });
   }
 
@@ -496,7 +552,8 @@ impl App {
     self.selected = 0;
     self.screen = Screen::Credentials;
     self.show_visualizer = false;
-    self.status = "Enter credentials for an S3-compatible bucket.".to_owned();
+    self.status =
+      "Enter different credentials, or press Ctrl+D to forget the saved connection.".to_owned();
   }
 
   fn handle_credentials_key(
@@ -504,6 +561,9 @@ impl App {
     key: KeyEvent,
     tx: &mpsc::UnboundedSender<AppEvent>,
   ) -> bool {
+    if self.busy {
+      return key.code == KeyCode::Esc;
+    }
     match key.code {
       KeyCode::Esc => return true,
       KeyCode::Tab | KeyCode::Down => {
@@ -520,6 +580,9 @@ impl App {
       KeyCode::Backspace => {
         let field = CredentialField::ALL[self.credentials.selected];
         self.credentials.value_mut(field).pop();
+      }
+      KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        self.begin_forget_credentials(tx);
       }
       KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
         let field = CredentialField::ALL[self.credentials.selected];
@@ -575,10 +638,34 @@ impl App {
   fn handle_event(&mut self, event: AppEvent, tx: &mpsc::UnboundedSender<AppEvent>) -> bool {
     match event {
       AppEvent::Key(key) => return self.handle_key(key, tx),
+      AppEvent::SavedCredentials(result) => {
+        self.busy = false;
+        match result {
+          Ok(Some(details)) => {
+            self.credentials.apply(&details);
+            self.begin_connect_with(details, tx);
+          }
+          Ok(None) => {
+            self.status =
+              "Enter credentials once; a successful connection will be saved securely.".to_owned();
+          }
+          Err(message) => self.status = message,
+        }
+      }
+      AppEvent::ForgotCredentials(result) => {
+        self.busy = false;
+        match result {
+          Ok(()) => {
+            self.credentials.clear();
+            self.status = "Saved credentials removed from the OS keyring.".to_owned();
+          }
+          Err(message) => self.status = message,
+        }
+      }
       AppEvent::Connected { generation, result } if generation == self.generation => {
         self.busy = false;
         match result {
-          Ok((storage, entries)) => {
+          Ok((storage, entries, save_error)) => {
             let count = entries.len();
             self.storage = Some(storage);
             self.entries = entries;
@@ -586,7 +673,10 @@ impl App {
             self.prefix.clear();
             self.screen = Screen::Browser;
             self.credentials.clear_sensitive();
-            self.status = listing_status(count);
+            self.status = match save_error {
+              Some(message) => format!("{} {message}", listing_status(count)),
+              None => format!("{} Credentials saved securely.", listing_status(count)),
+            };
           }
           Err(message) => self.status = message,
         }
@@ -693,9 +783,11 @@ impl App {
 
 enum AppEvent {
   Key(KeyEvent),
+  SavedCredentials(Result<Option<ConnectionDetails>, String>),
+  ForgotCredentials(Result<(), String>),
   Connected {
     generation: u64,
-    result: Result<(Storage, Vec<Entry>), String>,
+    result: Result<(Storage, Vec<Entry>, Option<String>), String>,
   },
   Listed {
     generation: u64,
@@ -741,6 +833,7 @@ pub async fn run() -> Result<()> {
   let mut app = App::default();
   let running = Arc::new(AtomicBool::new(true));
   let (tx, mut rx) = mpsc::unbounded_channel();
+  app.begin_load_saved_credentials(&tx);
   spawn_input_thread(Arc::clone(&running), tx.clone());
   let mut tick = tokio::time::interval(Duration::from_millis(150));
 

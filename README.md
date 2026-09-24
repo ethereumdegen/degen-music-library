@@ -77,6 +77,7 @@ The first build can take a few minutes because it compiles the AWS SDK and audio
 - A current Rust toolchain
 - A working system audio output
 - An S3-compatible bucket with permission to list and read objects
+- An OS credential store to save connections: Secret Service on Linux, Keychain on macOS, or Credential Manager on Windows
 
 Install Rust with [rustup](https://rustup.rs/) if `cargo` is not already available.
 
@@ -93,6 +94,8 @@ Enter these values on the connection screen:
 | Bucket | Your R2 bucket name |
 | Access key ID | Access key from the R2 API token |
 | Secret access key | Secret key from the R2 API token |
+
+After the first successful connection, all five values are saved in the operating system's credential store. Later launches load them from the keyring and reconnect automatically.
 
 The account ID is shown in the Cloudflare dashboard. It is not the bucket name.
 
@@ -138,6 +141,7 @@ Degen Music Library uses path-style bucket addressing for compatibility with cus
 | `Shift+Tab` / `Up` | Previous field |
 | `Ctrl+U` | Clear the selected field |
 | `Enter` | Connect and open the bucket |
+| `Ctrl+D` | Forget the saved connection |
 | `Esc` | Quit |
 
 ### Library browser
@@ -168,10 +172,12 @@ Rapid navigation never queues tracks. Each `n` or `p` press stops current playba
 
 ## Security and privacy
 
-- Credentials are entered interactively and are never written to disk.
+- A successful connection is saved as one encrypted entry in the operating system's credential store: Secret Service on Linux, Keychain on macOS, or Credential Manager on Windows.
+- Later launches retrieve that entry and reconnect automatically.
 - The secret access key is masked in the terminal.
-- Access-key and secret-key form buffers are zeroed after a successful connection.
-- Credentials remain in the in-memory AWS SDK client only for the active session.
+- Access-key and secret-key form buffers and temporary serialization buffers are zeroed after use.
+- If the OS credential store is unavailable, playback still works but the app reports that credentials were not saved.
+- `Ctrl+D` on the connection screen permanently removes the saved entry.
 - Audio objects are downloaded to managed temporary files rather than retained in the music directory.
 - Temporary audio files are removed when the cached track is dropped or the application exits.
 - The application contains no telemetry or analytics integration.
@@ -221,6 +227,7 @@ Project layout:
 
 ```text
 src/
+├── credential_store.rs secure OS-keyring persistence
 ├── app.rs      application state, input handling, and async task coordination
 ├── player.rs   audio device, decoder, and playback controls
 ├── storage.rs  S3 connection, listing, filtering, and downloads

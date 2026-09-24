@@ -93,19 +93,22 @@ fn draw_credentials(frame: &mut ratatui::Frame<'_>, app: &App) {
       .style(Style::default().fg(MUTED)),
     rows[6],
   );
-  let status_style = if app.status.starts_with("Connection failed") {
-    Style::default().fg(ERROR)
-  } else if app.busy {
-    Style::default().fg(SECONDARY)
-  } else {
-    Style::default().fg(SUCCESS)
-  };
+  let status_style =
+    if app.status.starts_with("Connection failed") || app.status.starts_with("Could not") {
+      Style::default().fg(ERROR)
+    } else if app.busy {
+      Style::default().fg(SECONDARY)
+    } else {
+      Style::default().fg(SUCCESS)
+    };
   frame.render_widget(
     Paragraph::new(vec![
       Line::styled(&app.status, status_style),
-      Line::from("Tab/Up/Down: field   Enter: connect   Ctrl+U: clear field   Esc: quit"),
+      Line::from(
+        "Tab/Up/Down: field   Enter: connect   Ctrl+U: clear field   Ctrl+D: forget saved",
+      ),
       Line::styled(
-        "Credentials are never written to disk.",
+        "Successful connections are saved securely in your OS keyring. Esc: quit.",
         Style::default().fg(MUTED),
       ),
     ])

@@ -1,4 +1,5 @@
 mod app;
+mod credential_store;
 mod player;
 mod storage;
 mod ui;
